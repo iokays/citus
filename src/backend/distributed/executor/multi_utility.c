@@ -18,11 +18,13 @@
 #include "commands/defrem.h"
 #include "commands/tablecmds.h"
 #include "distributed/citus_ruleutils.h"
+#include "distributed/connection_cache.h"
 #include "distributed/master_protocol.h"
 #include "distributed/metadata_cache.h"
 #include "distributed/multi_copy.h"
 #include "distributed/multi_utility.h"
 #include "distributed/multi_join_order.h"
+#include "distributed/multi_transaction.h"
 #include "distributed/transmit.h"
 #include "distributed/worker_manager.h"
 #include "distributed/worker_protocol.h"
@@ -36,11 +38,13 @@
 #include "utils/builtins.h"
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
+#include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/syscache.h"
 
 
 bool EnableDDLPropagation = true; /* ddl propagation is enabled */
+
 
 /*
  * This struct defines the state for the callback for drop statements.
@@ -80,11 +84,18 @@ static bool IsAlterTableRenameStmt(RenameStmt *renameStatement);
 static void ExecuteDistributedDDLCommand(Oid relationId, const char *ddlCommandString);
 static bool ExecuteCommandOnWorkerShards(Oid relationId, const char *commandString,
 										 List **failedPlacementList);
+static HTAB * OpenConnectionsToAllShardPlacements(List *shardIdList, char *relationOwner);
+static void CompleteShardPlacementTransactions(XactEvent event, void *arg);
+static void ExecuteCommandOnShardReplicas(StringInfo applyCommand, uint64 shardId,
+										  ShardConnections *shardConnections);
 static bool AllFinalizedPlacementsAccessible(Oid relationId);
 static void RangeVarCallbackForDropIndex(const RangeVar *rel, Oid relOid, Oid oldRelOid,
 										 void *arg);
 static void CheckCopyPermissions(CopyStmt *copyStatement);
 static List * CopyGetAttnums(TupleDesc tupDesc, Relation rel, List *attnamelist);
+
+static List *shardPlacementConnectionList = NIL;
+static bool isXactCallbackRegistered = false;
 
 
 /*
@@ -986,9 +997,9 @@ IsAlterTableRenameStmt(RenameStmt *renameStmt)
 /*
  * ExecuteDistributedDDLCommand applies a given DDL command to the given
  * distributed table. If the function is unable to access all the finalized
- * shard placements, then it fails early and errors out. If the command
- * successfully executed on any finalized shard placement, and failed on
- * others, then it marks the placements on which execution failed as invalid.
+ * shard placements, then it fails early and errors out. Two phase commit 
+ * mechanism is used so that a BEGIN is sent before each of the shard commands
+ * and COMMIT/ROLLBACK is handled by CompleteShardPlacementTransactions function.
  */
 static void
 ExecuteDistributedDDLCommand(Oid relationId, const char *ddlCommandString)
@@ -1045,88 +1056,203 @@ ExecuteDistributedDDLCommand(Oid relationId, const char *ddlCommandString)
 
 /*
  * ExecuteCommandOnWorkerShards executes a given command on all the finalized
- * shard placements of the given table. If the remote command errors out on the
- * first attempted placement, the function returns false. Otherwise, it returns
- * true.
- *
- * If the remote query errors out on the first attempted placement, it is very
- * likely that the command is going to fail on other placements too. This is
- * because most errors here will be PostgreSQL errors. Hence, the function fails
- * fast to avoid marking a high number of placements as failed. If the command
- * succeeds on at least one placement before failing on others, then the list of
- * failed placements is returned in failedPlacementList.
+ * shard placements of the given table with two-phase commit.
+ * 
+ * ExecuteCommandOnWorkerShards opens an individual connection for each of the   
+ * shard placement. After all connections are opened, a BEGIN command followed by 
+ * a proper "SELECT worker_apply_shard_ddl_command(<shardId>, <DDL Command>)" is
+ * sent to all open connections in a serial manner.
+ * 
+ * The opened transactions are handled by the CompleteShardPlacementTransactions
+ * function.
  *
  * Note: There are certain errors which would occur on few nodes and not on the
  * others. For example, adding a column with a type which exists on some nodes
- * and not on the others. In that case, this function might still end up returning
- * a large number of placements as failed.
+ * and not on the others. 
+ * 
+ * Note: The execution will be blocked if a prepared transaction from previous
+ * executions exist on the workers. In this case, those prepared transactions should
+ * be removed by either COMMIT PREPARED or ROLLBACK PREPARED.
  */
 static bool
 ExecuteCommandOnWorkerShards(Oid relationId, const char *commandString,
 							 List **failedPlacementList)
 {
-	bool isFirstPlacement = true;
-	ListCell *shardCell = NULL;
-	List *shardList = NIL;
+	List *shardIdList = LoadShardList(relationId);
 	char *relationOwner = TableOwner(relationId);
+	HTAB *shardConnectionHash = OpenConnectionsToAllShardPlacements(shardIdList,
+																	relationOwner);
+	ListCell *shardCell = NULL;
 
-	shardList = LoadShardList(relationId);
-	foreach(shardCell, shardList)
+	foreach(shardCell, shardIdList)
 	{
-		List *shardPlacementList = NIL;
-		ListCell *shardPlacementCell = NULL;
 		uint64 *shardIdPointer = (uint64 *) lfirst(shardCell);
 		uint64 shardId = (*shardIdPointer);
+		ShardConnections *shardConnections = NULL;
+		bool shardConnectionsFound = false;
+		char *escapedCommandString = NULL;
+		StringInfo applyCommand = makeStringInfo();
+
+		shardConnections = GetShardConnections(shardConnectionHash,
+											   shardId,
+											   &shardConnectionsFound);
+		Assert(shardConnectionsFound);
 
 		/* build the shard ddl command */
-		char *escapedCommandString = quote_literal_cstr(commandString);
-		StringInfo applyCommand = makeStringInfo();
+		escapedCommandString = quote_literal_cstr(commandString);
 		appendStringInfo(applyCommand, WORKER_APPLY_SHARD_DDL_COMMAND, shardId,
 						 escapedCommandString);
 
-		shardPlacementList = FinalizedShardPlacementList(shardId);
-		foreach(shardPlacementCell, shardPlacementList)
-		{
-			ShardPlacement *placement = (ShardPlacement *) lfirst(shardPlacementCell);
-			char *workerName = placement->nodeName;
-			uint32 workerPort = placement->nodePort;
-
-			List *queryResultList = ExecuteRemoteQuery(workerName, workerPort,
-													   relationOwner, applyCommand);
-			if (queryResultList == NIL)
-			{
-				/*
-				 * If we failed on the first placement, return false. We return
-				 * here instead of exiting at the end to avoid breaking through
-				 * multiple loops.
-				 */
-				if (isFirstPlacement)
-				{
-					return false;
-				}
-
-				ereport(WARNING, (errmsg("could not apply command on shard "
-										 UINT64_FORMAT " on node %s:%d", shardId,
-										 workerName, workerPort),
-								  errdetail("Shard placement will be marked as "
-											"inactive.")));
-
-				*failedPlacementList = lappend(*failedPlacementList, placement);
-			}
-			else
-			{
-				ereport(DEBUG2, (errmsg("applied command on shard " UINT64_FORMAT
-										" on node %s:%d", shardId, workerName,
-										workerPort)));
-			}
-
-			isFirstPlacement = false;
-		}
+		ExecuteCommandOnShardReplicas(applyCommand, shardId, shardConnections);
 
 		FreeStringInfo(applyCommand);
 	}
 
+	/* check for cancellation one last time before returning */
+	CHECK_FOR_INTERRUPTS();
+
+	/* CloseConnections(allShardsConnectionList); */
+
 	return true;
+}
+
+
+/*
+ * OpenConnectionsToAllShardPlacement opens connections to all placements of
+ * the given shard Id Pointer List and returns the hash table containing the connections.
+ * The resulting hash table maps shardIds to ShardConnection structs.
+ */
+static HTAB *
+OpenConnectionsToAllShardPlacements(List *shardIdList, char *relationOwner)
+{
+	HTAB *shardConnectionHash = CreateShardConnectionHash();
+	ListCell *shardCell = NULL;
+	MemoryContext oldContext = MemoryContextSwitchTo(TopTransactionContext);
+
+	foreach(shardCell, shardIdList)
+	{
+		uint64 *shardIdPointer = (uint64 *) lfirst(shardCell);
+		uint64 shardId = (*shardIdPointer);
+
+		OpenConnectionsToShardPlacements(shardId, shardConnectionHash, relationOwner);
+	}
+
+	shardPlacementConnectionList = ConnectionList(shardConnectionHash);
+
+	MemoryContextSwitchTo(oldContext);
+
+	if (!isXactCallbackRegistered)
+	{
+		RegisterXactCallback(CompleteShardPlacementTransactions, NULL);
+		isXactCallbackRegistered = true;
+	}
+
+	return shardConnectionHash;
+}
+
+
+/*
+ * CompleteShardPlacementTransactions commits or aborts pending shard placement
+ * transactions when the local transaction commits or aborts.
+ */
+static void
+CompleteShardPlacementTransactions(XactEvent event, void *arg)
+{
+	if (shardPlacementConnectionList == NIL)
+	{
+		/* nothing to do */
+		return;
+	}
+	else if (event == XACT_EVENT_PRE_COMMIT)
+	{
+		/*
+		 * Any failure here will cause local changes to be rolled back,
+		 * and remote changes to either roll back (1PC) or, in case of
+		 * connection or node failure, leave a prepared transaction
+		 * (2PC).
+		 */
+
+		PrepareRemoteTransactions(shardPlacementConnectionList);
+
+		return;
+	}
+	else if (event == XACT_EVENT_COMMIT)
+	{
+		/*
+		 * A failure here will cause some remote changes to either
+		 * roll back (1PC) or, in case of connection or node failure,
+		 * leave a prepared transaction (2PC). However, the local
+		 * changes have already been committed.
+		 */
+
+		CommitRemoteTransactions(shardPlacementConnectionList, false);
+	}
+	else if (event == XACT_EVENT_ABORT)
+	{
+		/*
+		 * A failure here will cause some remote changes to either
+		 * roll back (1PC) or, in case of connection or node failure,
+		 * leave a prepared transaction (2PC). The local changes have
+		 * already been rolled back.
+		 */
+
+		AbortRemoteTransactions(shardPlacementConnectionList);
+	}
+	else
+	{
+		return;
+	}
+
+	CloseConnections(shardPlacementConnectionList);
+	shardPlacementConnectionList = NIL;
+}
+
+
+static void
+ExecuteCommandOnShardReplicas(StringInfo applyCommand, uint64 shardId,
+							  ShardConnections *shardConnections)
+{
+	List *connectionList = shardConnections->connectionList;
+	ListCell *connectionCell = NULL;
+
+	Assert(connectionList != NIL);
+
+	foreach(connectionCell, connectionList)
+	{
+		TransactionConnection *transactionConnection =
+			(TransactionConnection *) lfirst(connectionCell);
+		PGconn *connection = transactionConnection->connection;
+		PGresult *result = NULL;
+
+		/* send the query */
+		result = PQexec(connection, "BEGIN");
+		if (PQresultStatus(result) != PGRES_COMMAND_OK)
+		{
+			WarnRemoteError(connection, result);
+			ereport(ERROR, (errmsg("could not send ddl command to shard placement")));
+		}
+
+		result = PQexec(connection, applyCommand->data);
+		if (PQresultStatus(result) != PGRES_TUPLES_OK)
+		{
+			WarnRemoteError(connection, result);
+			ereport(ERROR, (errmsg("could not execute DDL command on worker "
+								   "node shards")));
+		}
+		else
+		{
+			char *workerName = ConnectionGetOptionValue(connection, "host");
+			char *workerPort = ConnectionGetOptionValue(connection, "port");
+
+			ereport(DEBUG2, (errmsg("applied command on shard " UINT64_FORMAT
+									" on node %s:%s", shardId, workerName,
+									workerPort)));
+		}
+
+		PQclear(result);
+
+		transactionConnection->transactionState = TRANSACTION_STATE_OPEN;
+	}
 }
 
 
